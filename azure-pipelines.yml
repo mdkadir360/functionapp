@@ -1,0 +1,104 @@
+trigger:
+- feature/mdkadir   # change branch if needed
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  azureServiceConnection: 'myconnection'     # ADO service connection
+  resourceGroupName: 'demo_rg11'
+  functionAppName: 'my-func-demo-app'
+  repoRoot: '$(System.DefaultWorkingDirectory)'
+  buildDir: '$(Build.ArtifactStagingDirectory)'
+  zipPath: '$(Build.ArtifactStagingDirectory)/functionapp.zip'
+
+stages:
+# ===========================
+# 1) BUILD
+# ===========================
+- stage: Build
+  displayName: "Build Python Azure Function"
+  jobs:
+  - job: BuildJob
+    displayName: "Prepare dependencies & package"
+    steps:
+    - checkout: self
+
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '3.10'
+
+    # Install deps into .python_packages (Azure Functions Python expects this path)
+    - script: |
+        set -e
+        cd "$(repoRoot)"
+        python -m pip install --upgrade pip
+        if [ -f requirements.txt ]; then
+          pip install -r requirements.txt --target "./.python_packages/lib/site-packages"
+        fi
+      displayName: "Install Python dependencies"
+
+    # Sanity check: host.json must exist at repo root
+    - script: |
+        set -e
+        cd "$(repoRoot)"
+        if [ ! -f "host.json" ]; then
+          echo "ERROR: host.json not found at repo root ($(repoRoot))."
+          exit 1
+        fi
+        echo "Repo tree (top level):"
+        ls -la
+      displayName: "Check host.json exists"
+
+    # Package everything (exclude venv, git, artifacts)
+    - script: |
+        set -e
+        mkdir -p "$(buildDir)"
+        cd "$(repoRoot)"
+        zip -r "$(zipPath)" . \
+          -x "*.git/*" ".git/*" ".venv/*" \
+             "$(Build.ArtifactStagingDirectory)/*" \
+             "$(Pipeline.Workspace)/*" \
+             "obj/*" "bin/*" \
+             "*.pyc" "__pycache__/*"
+        echo "Created package: $(zipPath)"
+      displayName: "Package function app"
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(zipPath)'
+        ArtifactName: 'drop'
+        publishLocation: 'Container'
+
+# ===========================
+# 2) DEPLOY
+# ===========================
+- stage: Deploy
+  displayName: "Deploy to Azure Function"
+  dependsOn: Build
+  jobs:
+  - job: DeployJob
+    displayName: "Deploy Function App"
+    steps:
+    - task: DownloadBuildArtifacts@0
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        artifactName: 'drop'
+        downloadPath: '$(Pipeline.Workspace)'
+
+    # Deploy using AzureFunctionApp@1 (works with Linux Consumption)
+    - task: AzureFunctionApp@1
+      displayName: "Deploy Function App"
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        appType: 'functionAppLinux'
+        appName: '$(functionAppName)'
+        package: '$(Pipeline.Workspace)/drop/functionapp.zip'
+
+    # Optional warm-up
+    - script: |
+        set +e
+        echo "Warming up app..."
+        curl -I "https://$(functionAppName).canadacentral.azurewebsites.net" || true
+      displayName: "Warm-up (optional)"
